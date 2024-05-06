@@ -593,9 +593,7 @@ def main(args):
     )
 
     # Load scheduler and models
-    noise_scheduler = EulerDiscreteScheduler.from_pretrained(
-        args.pretrained_model_name_or_path, subfolder="scheduler", timestep_spacing="trailing"
-    )
+    noise_scheduler = DDPMScheduler.from_pretrained(args.pretrained_model_name_or_path, subfolder="scheduler")
     text_encoder_one = text_encoder_cls_one.from_pretrained(
         args.pretrained_model_name_or_path, subfolder="text_encoder", revision=args.revision, variant=args.variant
     )
@@ -896,6 +894,13 @@ def main(args):
 
     def preprocess_train(examples):
         images = [Image.open(os.path.join(args.dataset_name, image)) for image in examples[image_column]]
+        txt = []
+        for text in examples[caption_column]:
+            file_path = os.path.join(args.dataset_name, text)
+            with open(file_path, "r") as file:
+                content = file.read()
+                txt.append(content)
+        examples[caption_column] = txt
         # image aug
         original_sizes = []
         all_images = []

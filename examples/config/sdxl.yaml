@@ -1,13 +1,13 @@
 pretrained_model_name_or_path: "stabilityai/stable-diffusion-xl-base-1.0"
 pretrained_vae_model_name_or_path: "madebyollin/sdxl-vae-fp16-fix"
-dataset_name: "lambdalabs/pokemon-blip-captions"
+dataset_name: "diffusers/pokemon-gpt4-captions"
 caption_column: "text"
 resolution: 1024
 random_flip: true
 train_batch_size: 1
 num_train_epochs: 2
 checkpointing_steps: 500
-learning_rate: 1e-04
+learning_rate: 0.00001
 lr_scheduler: "constant"
 lr_warmup_steps: 0
 mixed_precision: "fp16"

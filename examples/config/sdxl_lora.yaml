@@ -14,5 +14,5 @@ lr_warmup_steps: 0
 mixed_precision: "fp16"
 seed: 42
 output_dir: "sdxl-lora"
-validation_prompt: "cute dragon creature"
+validation_prompt: "a blouse"
 report_to: "tensorboard"
