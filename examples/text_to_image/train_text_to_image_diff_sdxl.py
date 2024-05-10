@@ -13,9 +13,10 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Fine-tuning script for Stable Diffusion XL for text2image with support for LoRA."""
+"""Fine-tuning script for Stable Diffusion XL for text2image with support for DiffFit."""
 
 import argparse
+import json
 import logging
 import math
 import os
@@ -65,8 +66,15 @@ from diffusers.utils import (
 from diffusers.utils.hub_utils import load_or_create_model_card, populate_model_card
 from diffusers.utils.import_utils import is_xformers_available
 from diffusers.utils.torch_utils import is_compiled_module
+from safetensors.torch import save_file
 
-
+from difffit_pytorch.utils import (
+    mark_only_biases_as_trainable,
+    get_state_dict,
+    load_text_encoder_for_difffit,
+    load_config_for_difffit,
+    load_unet_for_difffit,
+)
 # Will error if the minimal version of diffusers is not installed. Remove at your own risks.
 check_min_version("0.28.0.dev0")
 
@@ -611,15 +619,22 @@ def main(args):
         revision=args.revision,
         variant=args.variant,
     )
-    unet = UNet2DConditionModel.from_pretrained(
-        args.pretrained_model_name_or_path, subfolder="unet", revision=args.revision, variant=args.variant
-    )
+    # unet = UNet2DConditionModel.from_pretrained(
+    #     args.pretrained_model_name_or_path, subfolder="unet", revision=args.revision, variant=args.variant
+    # )
+
+    # ========================================================
+    # Set correct Diff layers
+    unet = load_unet_for_difffit(args.pretrained_model_name_or_path, subfolder="unet", revision=args.revision)
+    # ========================================================
 
     # We only train the additional adapter LoRA layers
     vae.requires_grad_(False)
     text_encoder_one.requires_grad_(False)
     text_encoder_two.requires_grad_(False)
     unet.requires_grad_(False)
+    unet = mark_only_biases_as_trainable(unet)
+
 
     # For mixed precision training we cast all non-trainable weights (vae, non-lora text_encoder and non-lora unet) to half-precision
     # as these weights are only used for inference, keeping weights in full precision is not required.
@@ -655,14 +670,18 @@ def main(args):
 
     # now we will add new LoRA weights to the attention layers
     # Set correct lora layers
-    unet_lora_config = LoraConfig(
-        r=args.rank,
-        lora_alpha=args.rank,
-        init_lora_weights="gaussian",
-        target_modules=["to_k", "to_q", "to_v", "to_out.0"],
-    )
+    # unet_lora_config = LoraConfig(
+    #     r=args.rank,
+    #     lora_alpha=args.rank,
+    #     init_lora_weights="gaussian",
+    #     target_modules=["to_k", "to_q", "to_v", "to_out.0"],
+    # )
+    #
+    # unet.add_adapter(unet_lora_config)
 
-    unet.add_adapter(unet_lora_config)
+
+
+
 
     # The text encoder comes from 🤗 transformers, we will also attach adapters to it.
     if args.train_text_encoder:
@@ -682,87 +701,17 @@ def main(args):
         return model
 
     # create custom saving & loading hooks so that `accelerator.save_state(...)` serializes in a nice format
-    def save_model_hook(models, weights, output_dir):
+    def save_weights(step, save_path=None):
+        # Create the pipeline using using the trained modules and save it.
         if accelerator.is_main_process:
-            # there are only two options here. Either are just the unet attn processor layers
-            # or there are the unet and text encoder attn layers
-            unet_lora_layers_to_save = None
-            text_encoder_one_lora_layers_to_save = None
-            text_encoder_two_lora_layers_to_save = None
-
-            for model in models:
-                if isinstance(unwrap_model(model), type(unwrap_model(unet))):
-                    unet_lora_layers_to_save = convert_state_dict_to_diffusers(get_peft_model_state_dict(model))
-                elif isinstance(unwrap_model(model), type(unwrap_model(text_encoder_one))):
-                    text_encoder_one_lora_layers_to_save = convert_state_dict_to_diffusers(
-                        get_peft_model_state_dict(model)
-                    )
-                elif isinstance(unwrap_model(model), type(unwrap_model(text_encoder_two))):
-                    text_encoder_two_lora_layers_to_save = convert_state_dict_to_diffusers(
-                        get_peft_model_state_dict(model)
-                    )
-                else:
-                    raise ValueError(f"unexpected save model: {model.__class__}")
-
-                # make sure to pop weight so that corresponding model is not saved again
-                if weights:
-                    weights.pop()
-
-            StableDiffusionXLPipeline.save_lora_weights(
-                output_dir,
-                unet_lora_layers=unet_lora_layers_to_save,
-                text_encoder_lora_layers=text_encoder_one_lora_layers_to_save,
-                text_encoder_2_lora_layers=text_encoder_two_lora_layers_to_save,
-            )
-
-    def load_model_hook(models, input_dir):
-        unet_ = None
-        text_encoder_one_ = None
-        text_encoder_two_ = None
-
-        while len(models) > 0:
-            model = models.pop()
-
-            if isinstance(model, type(unwrap_model(unet))):
-                unet_ = model
-            elif isinstance(model, type(unwrap_model(text_encoder_one))):
-                text_encoder_one_ = model
-            elif isinstance(model, type(unwrap_model(text_encoder_two))):
-                text_encoder_two_ = model
-            else:
-                raise ValueError(f"unexpected save model: {model.__class__}")
-
-        lora_state_dict, _ = LoraLoaderMixin.lora_state_dict(input_dir)
-        unet_state_dict = {f'{k.replace("unet.", "")}': v for k, v in lora_state_dict.items() if k.startswith("unet.")}
-        unet_state_dict = convert_unet_state_dict_to_peft(unet_state_dict)
-        incompatible_keys = set_peft_model_state_dict(unet_, unet_state_dict, adapter_name="default")
-        if incompatible_keys is not None:
-            # check only for unexpected keys
-            unexpected_keys = getattr(incompatible_keys, "unexpected_keys", None)
-            if unexpected_keys:
-                logger.warning(
-                    f"Loading adapter weights from state_dict led to unexpected keys not found in the model: "
-                    f" {unexpected_keys}. "
-                )
-
-        if args.train_text_encoder:
-            _set_state_dict_into_text_encoder(lora_state_dict, prefix="text_encoder.", text_encoder=text_encoder_one_)
-
-            _set_state_dict_into_text_encoder(
-                lora_state_dict, prefix="text_encoder_2.", text_encoder=text_encoder_two_
-            )
-
-        # Make sure the trainable params are in float32. This is again needed since the base models
-        # are in `weight_dtype`. More details:
-        # https://github.com/huggingface/diffusers/pull/6514#discussion_r1449796804
-        if args.mixed_precision == "fp16":
-            models = [unet_]
-            if args.train_text_encoder:
-                models.extend([text_encoder_one_, text_encoder_two_])
-            cast_training_params(models, dtype=torch.float32)
-
-    accelerator.register_save_state_pre_hook(save_model_hook)
-    accelerator.register_load_state_pre_hook(load_model_hook)
+            if save_path is None:
+                save_path = os.path.join(args.output_dir, f"checkpoint-{step}")
+            os.makedirs(save_path, exist_ok=True)
+            state_dict = get_state_dict(accelerator.unwrap_model(unet, keep_fp32_wrapper=True))
+            save_file(state_dict, os.path.join(save_path, "efficient_weights.safetensors"))
+            with open(os.path.join(save_path, "config.json"), "w") as f:
+                json.dump(args.__dict__, f, indent=2)
+            print(f"[*] Weights saved at {save_path}")
 
     if args.gradient_checkpointing:
         unet.enable_gradient_checkpointing()
@@ -1198,8 +1147,10 @@ def main(args):
                                     shutil.rmtree(removing_checkpoint)
 
                         save_path = os.path.join(args.output_dir, f"checkpoint-{global_step}")
-                        accelerator.save_state(save_path)
+                        # accelerator.save_state(save_path)
                         logger.info(f"Saved state to {save_path}")
+                        save_weights(global_step, save_path)
+
 
             logs = {"step_loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0]}
             progress_bar.set_postfix(**logs)
@@ -1262,31 +1213,11 @@ def main(args):
     # Save the lora layers
     accelerator.wait_for_everyone()
     if accelerator.is_main_process:
-        unet = unwrap_model(unet)
-        unet_lora_state_dict = convert_state_dict_to_diffusers(get_peft_model_state_dict(unet))
-
-        if args.train_text_encoder:
-            text_encoder_one = unwrap_model(text_encoder_one)
-            text_encoder_two = unwrap_model(text_encoder_two)
-
-            text_encoder_lora_layers = convert_state_dict_to_diffusers(get_peft_model_state_dict(text_encoder_one))
-            text_encoder_2_lora_layers = convert_state_dict_to_diffusers(get_peft_model_state_dict(text_encoder_two))
-        else:
-            text_encoder_lora_layers = None
-            text_encoder_2_lora_layers = None
-
-        StableDiffusionXLPipeline.save_lora_weights(
-            save_directory=args.output_dir,
-            unet_lora_layers=unet_lora_state_dict,
-            text_encoder_lora_layers=text_encoder_lora_layers,
-            text_encoder_2_lora_layers=text_encoder_2_lora_layers,
-        )
+        save_weights(global_step, args.output_dir)
 
         del unet
         del text_encoder_one
         del text_encoder_two
-        del text_encoder_lora_layers
-        del text_encoder_2_lora_layers
         torch.cuda.empty_cache()
 
         # Final inference
@@ -1304,7 +1235,10 @@ def main(args):
         pipeline = pipeline.to(accelerator.device)
 
         # load attention processors
-        pipeline.load_lora_weights(args.output_dir)
+        unet = load_unet_for_difffit(args.pretrained_model_name_or_path, subfolder="unet",
+                                     efficient_weights_ckpt=args.output_dir, revision=args.revision)
+
+        # pipeline.load_lora_weights(args.output_dir)
 
         # run inference
         images = []
